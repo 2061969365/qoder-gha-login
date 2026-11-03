@@ -11,8 +11,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install CLI
         run: curl -fsSL https://qoder.com/install | bash
+      - name: Try token as JOB token
+        env:
+          QODER_JOB_TOKEN: ${{ inputs.token }}
+        run: |
+          timeout 120 qodercli -p -o json "Reply with exactly: job-ok" && echo "JOB_TOKEN_OK" || echo "JOB_TOKEN_FAIL=$?"
       - name: Try token as PAT
         env:
           QODER_PERSONAL_ACCESS_TOKEN: ${{ inputs.token }}
         run: |
-          timeout 120 qodercli -p -o json "Reply with exactly: pat-ok" || echo "EXIT=$?"
+          timeout 120 qodercli -p -o json "Reply with exactly: pat-ok" && echo "PAT_OK" || echo "PAT_FAIL=$?"

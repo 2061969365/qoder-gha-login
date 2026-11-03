@@ -10,3 +10,6 @@ hits*.txt
 cred_ctx.txt
 strs.py
 __pycache__/
+
+# Windows desktop app extraction (local inspection only)
+.win/

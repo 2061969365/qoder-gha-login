@@ -91,6 +91,63 @@ def emit_github_output(**kv) -> None:
             f.write(f"{k}={v}\n")
 
 
+def _read_csrf(opener: urllib.request.OpenerDirector) -> str:
+    """取 qoder.com 页面里的 csrfToken + 会话 cookie（PAT 写接口要求 X-CSRF-TOKEN）。"""
+    req = urllib.request.Request(
+        f"{DASHBOARD}/users/sign-in",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+    )
+    with opener.open(req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", "replace")
+    m = re.search(r"csrfToken\s*=\s*'([^']+)'", html)
+    return m.group(1) if m else ""
+
+
+def mint_pat(token: str, name: str, expires_at=None) -> tuple[int, dict]:
+    """用已登录会话的 Bearer token 调 /api/v1/me/personal-access-tokens 造 PAT。"""
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    csrf = _read_csrf(opener)
+
+    body = json.dumps({"name": name, "expires_at": expires_at}).encode()
+    req = urllib.request.Request(
+        f"{DASHBOARD}/api/v1/me/personal-access-tokens",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-CSRF-TOKEN": csrf,
+            "Origin": DASHBOARD,
+            "Referer": f"{DASHBOARD}/account/integrations",
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with opener.open(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return e.code, {"raw": raw}
+
+
+def extract_pat(payload: dict) -> str:
+    """兼容不同版本的返回字段。"""
+    keys = ("token", "pat", "personal_access_token", "personalAccessToken", "key", "secret")
+    for src in (payload, payload.get("data") if isinstance(payload.get("data"), dict) else {}):
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            v = src.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return ""
+
+
 def new_state(args) -> dict:
     is_ci = any(os.environ.get(k) for k in ("CI", "GITHUB_ACTIONS"))
     client_id = args.client_id or (CLIENT_ID_CI if is_ci else CLIENT_ID_DEFAULT)
