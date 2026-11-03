@@ -129,7 +129,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "auth_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "::notice::Qoder 登录链接已写入 Job Summary"
+          printf '%s\n' "$URL" > login-url.txt
+          echo "::notice::Qoder 登录链接已写入 Job Summary 与 artifact qoder-login-url"
+
+      # 运行中也能取到链接：artifact 在 upload 步骤结束即可下载，不必等 Job 完成
+      - name: Publish login URL as artifact
+        if: env.MODE == 'device'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-login-url
+          path: login-url.txt
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Wait for authorization
         if: env.MODE == 'device'
