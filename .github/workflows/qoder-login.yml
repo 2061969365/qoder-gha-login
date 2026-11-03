@@ -1,0 +1,185 @@
+name: qoder-login
+
+# Qoder 账号在 GitHub Actions 上「注册 + 登录」
+#
+# Linux 客户端 = Qoder CLI 官方 Linux 版（qoder.com/install，manifest 带 sha256）
+#
+# 两条路径：
+#   device —— 设备码登录（首次 / 换号 / 顺便注册）：Job 把授权链接写进 Summary，
+#             人在浏览器里注册或登录，CLI 自己完成授权并把凭据写进 QODER_CONFIG_DIR，
+#             随后 cache 起来给后续 Job 复用。
+#   pat    —— 无人值守：Secret 里放 QODER_PERSONAL_ACCESS_TOKEN
+#             （https://qoder.com/account/integrations 生成）。
+#
+# 为什么必须走浏览器（实测 2026-11，qoder.com 全球版）：
+#   POST /api/v1/users、/api/v1/sessions、/api/v1/verificationCodes 先被
+#   x-captcha-verify-param 拦成 403，缺 CSRF 是 400 CSRFInvalid —— 注册与密码登录
+#   都要过阿里云滑块验证码，纯 HTTP 走不通。设备码轮询 /api/v1/deviceToken/poll
+#   不需要 cookie/CSRF，是唯一可自动化的入口。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "device = 设备码交互登录（可注册）；pat = 用 Secret 里的 PAT"
+        type: choice
+        options: [device, pat]
+        default: device
+      login_timeout:
+        description: "等待浏览器授权的超时（秒）"
+        default: "900"
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qoder-login-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qoder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # 无图形环境标记：CLI 会跳过自动开浏览器，直接把登录 URL 打到 stdout
+      CI: "true"
+      BROWSER: www-browser
+      DEBIAN_FRONTEND: noninteractive
+      QODER_CONFIG_DIR: ${{ github.workspace }}/.qoder-home
+      MODE: ${{ github.event.inputs.mode || 'pat' }}
+      LOGIN_TIMEOUT: ${{ github.event.inputs.login_timeout || '900' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qoder CLI (Linux x64)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://qoder.com/install | bash -s -- --force --skip-path
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          qoder --version
+
+      - name: Restore cached Qoder credentials
+        uses: actions/cache/restore@v4
+        with:
+          path: .qoder-home
+          key: qoder-home-${{ github.repository }}-${{ github.run_id }}
+          restore-keys: |
+            qoder-home-${{ github.repository }}-
+
+      # ---------------- A. PAT 路径 ----------------
+      - name: Login with Personal Access Token
+        if: env.MODE == 'pat'
+        env:
+          QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${QODER_PERSONAL_ACCESS_TOKEN:-}" || { echo "::error::缺少 secret QODER_PERSONAL_ACCESS_TOKEN"; exit 1; }
+          qoder -p -o json "Reply with exactly: pong" | tee pat-check.json
+          grep -qi pong pat-check.json
+          echo "PAT 登录可用" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- B. 设备码路径（CLI 原生登录） ----------------
+      - name: Start device login and publish the URL
+        if: env.MODE == 'device'
+        id: device
+        run: |
+          set -euo pipefail
+          mkdir -p "$QODER_CONFIG_DIR"
+          : > login.log
+          # CLI 在 CI 里会自动走设备码：打印 URL -> 轮询 -> 授权后把凭据写进 QODER_CONFIG_DIR
+          setsid qoder login >>login.log 2>&1 &
+          echo $! > login.pid
+
+          URL=""
+          for _ in $(seq 1 120); do
+            URL=$(grep -oE 'https://[^[:space:]"]*device/[A-Za-z]+[^[:space:]"]*' login.log | head -1 || true)
+            [ -n "$URL" ] && break
+            if ! kill -0 "$(cat login.pid)" 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::warning::CLI 未在 120s 内打印登录链接，回退到脚本生成的设备码"
+            python3 qoder_device_login.py --print-only --state-out .qoder-device.json | tee -a login.log
+            URL=$(python3 -c 'import json;print(json.load(open(".qoder-device.json"))["auth_url"])')
+            echo "fallback=1" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "## Qoder 设备登录"
+            echo
+            echo "1. 打开下面的链接（手机也可以）"
+            echo "2. 已有账号 → 直接登录；没有账号 → 点 **Sign up** 注册（邮箱验证码），"
+            echo "   注册完成后 oauth_callback 会把你带回授权页"
+            echo "3. 选账号确认授权 —— 本 Job 会自动继续（最长 ${LOGIN_TIMEOUT}s）"
+            echo
+            echo '```'
+            echo "$URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "auth_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "::notice::Qoder 登录链接已写入 Job Summary"
+
+      - name: Wait for authorization
+        if: env.MODE == 'device'
+        run: |
+          set -euo pipefail
+          if [ "${fallback:-0}" = "1" ]; then
+            # CLI 没吐链接：用脚本轮询换 token，再用 token 直接验账号
+            python3 qoder_device_login.py --resume .qoder-device.json \
+              --out qoder-token.json --timeout "$LOGIN_TIMEOUT"
+            TOKEN=$(python3 -c 'import json;print(json.load(open("qoder-token.json"))["token"])')
+            curl -fsS https://qoder.com/api/v1/userinfo -H "Authorization: Bearer $TOKEN" \
+              -o userinfo.json
+            python3 -c 'import json;d=json.load(open("userinfo.json"));print("已登录:", d.get("name") or d.get("email") or d.get("id"))'
+            echo "QODER_DEVICE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          else
+            PID=$(cat login.pid)
+            END=$(( $(date +%s) + LOGIN_TIMEOUT ))
+            while kill -0 "$PID" 2>/dev/null; do
+              if [ "$(date +%s)" -ge "$END" ]; then
+                echo "::error::授权等待超时（${LOGIN_TIMEOUT}s），重跑会生成新链接"
+                tail -40 login.log
+                exit 1
+              fi
+              sleep 5
+            done
+            tail -40 login.log
+            grep -qiE 'Login successful|Welcome' login.log
+          fi
+          echo "QODER_TOKEN_OK=1" >> "$GITHUB_ENV"
+
+      - name: Verify the account works
+        run: |
+          set -euo pipefail
+          if [ -n "${QODER_DEVICE_TOKEN:-}" ]; then
+            # 脚本路径拿到的 device token 与 PAT 同属 Bearer 凭证，直接验 API
+            curl -fsS https://qoder.com/api/v1/userinfo -H "Authorization: Bearer $QODER_DEVICE_TOKEN" | head -c 400
+            echo
+          else
+            qoder -p -o json "Print the active model name, then say: ok" | tee verify.json
+            grep -qi ok verify.json
+          fi
+
+      - name: Save credential cache
+        if: env.QODER_TOKEN_OK == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .qoder-home
+          key: qoder-home-${{ github.repository }}-${{ github.run_id }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-login-logs
+          path: |
+            login.log
+            verify.json
+            pat-check.json
+          if-no-files-found: ignore

@@ -1,0 +1,12 @@
+qoder-token.json
+.qoder-device.json
+dev-state.json
+s2.json
+s3.json
+pkce.txt
+cli.tgz
+x/
+hits*.txt
+cred_ctx.txt
+strs.py
+__pycache__/
