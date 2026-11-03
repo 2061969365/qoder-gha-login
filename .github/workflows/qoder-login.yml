@@ -94,34 +94,15 @@ jobs:
         id: device
         run: |
           set -euo pipefail
-          mkdir -p "$QODER_CONFIG_DIR"
-          : > login.log
-          # CLI 在 CI 里会自动走设备码：打印 URL -> 轮询 -> 授权后把凭据写进 QODER_CONFIG_DIR
-          setsid qodercli login >>login.log 2>&1 &
-          echo $! > login.pid
-
-          URL=""
-          for _ in $(seq 1 120); do
-            URL=$(grep -oE 'https://[^[:space:]"]*device/[A-Za-z]+[^[:space:]"]*' login.log | head -1 || true)
-            [ -n "$URL" ] && break
-            if ! kill -0 "$(cat login.pid)" 2>/dev/null; then break; fi
-            sleep 1
-          done
-
-          if [ -z "$URL" ]; then
-            echo "::warning::CLI 未在 120s 内打印登录链接，回退到脚本生成的设备码"
-            python3 qoder_device_login.py --print-only --state-out .qoder-device.json | tee -a login.log
-            URL=$(python3 -c 'import json;print(json.load(open(".qoder-device.json"))["auth_url"])')
-            echo "fallback=1" >> "$GITHUB_ENV"
-          fi
-
+          python3 qoder_device_login.py --print-only --state-out .qoder-device.json | tee login.log
+          URL=$(python3 -c 'import json;print(json.load(open(".qoder-device.json"))["auth_url"])')
           {
             echo "## Qoder 设备登录"
             echo
             echo "1. 打开下面的链接（手机也可以）"
             echo "2. 已有账号 → 直接登录；没有账号 → 点 **Sign up** 注册（邮箱验证码），"
             echo "   注册完成后 oauth_callback 会把你带回授权页"
-            echo "3. 选账号确认授权 —— **链接只有 5 分钟有效期**（qodercli 侧硬超时 300s），过期重跑换新链接"
+            echo "3. 选账号确认授权 —— 本 Job 会自动继续（最长 ${LOGIN_TIMEOUT}s）"
             echo
             echo '```'
             echo "$URL"
@@ -145,46 +126,99 @@ jobs:
         if: env.MODE == 'device'
         run: |
           set -euo pipefail
-          if [ "${fallback:-0}" = "1" ]; then
-            # CLI 没吐链接：用脚本轮询换 token，再用 token 直接验账号
-            python3 qoder_device_login.py --resume .qoder-device.json \
-              --out qoder-token.json --timeout "$LOGIN_TIMEOUT"
-            TOKEN=$(python3 -c 'import json;print(json.load(open("qoder-token.json"))["token"])')
-            curl -fsS https://qoder.com/api/v1/userinfo -H "Authorization: Bearer $TOKEN" \
-              -o userinfo.json
-            python3 -c 'import json;d=json.load(open("userinfo.json"));print("已登录:", d.get("name") or d.get("email") or d.get("id"))'
-            echo "QODER_DEVICE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          else
-            PID=$(cat login.pid)
-            END=$(( $(date +%s) + LOGIN_TIMEOUT ))
-            while kill -0 "$PID" 2>/dev/null; do
-              if [ "$(date +%s)" -ge "$END" ]; then
-                echo "::error::授权等待超时（${LOGIN_TIMEOUT}s），重跑会生成新链接"
-                tail -40 login.log
-                exit 1
-              fi
-              sleep 5
-            done
-            tail -40 login.log
-            grep -qiE 'Login successful|Welcome' login.log
-          fi
+          python3 qoder_device_login.py --resume .qoder-device.json \
+            --out qoder-token.json --timeout "$LOGIN_TIMEOUT"
+          WHO=$(python3 -c 'import json;d=json.load(open("qoder-token.json"));print(d.get("user_name") or d.get("user_id"))')
+          echo "已登录：${WHO}" >> "$GITHUB_STEP_SUMMARY"
           echo "QODER_TOKEN_OK=1" >> "$GITHUB_ENV"
+
+      # ---------- 直接用登录拿到的 Bearer 造一个 PAT 并导出 ----------
+      - name: Mint Personal Access Token from the logged-in session
+        if: env.MODE == 'device' && env.QODER_TOKEN_OK == '1'
+        env:
+          PAT_NAME: gha-${{ github.repository }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(python3 -c 'import json;print(json.load(open("qoder-token.json"))["token"])')
+
+          # 先取 csrf cookie + csrfToken（PAT 写接口要求 X-CSRF-TOKEN）
+          rm -f cj.txt
+          CSRF=$(curl -sS -c cj.txt https://qoder.com/users/sign-in \
+                  | grep -oE "csrfToken = '[^']+'" | sed "s/.*'\(.*\)'/\1/")
+          echo "csrf 长度: ${#CSRF}"
+
+          curl -sS -b cj.txt -X POST "https://qoder.com/api/v1/me/personal-access-tokens" \
+            -H "Content-Type: application/json" \
+            -H "X-CSRF-TOKEN: ${CSRF}" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Origin: https://qoder.com" \
+            -H "Referer: https://qoder.com/account/integrations" \
+            -d "{\"name\":\"${PAT_NAME}\",\"expires_at\":null}" \
+            -o pat.json -w "HTTP %{http_code}\n"
+
+          cat pat.json
+          python3 - <<'PY'
+          import json, os, sys
+          d = json.load(open("pat.json"))
+          # 不同版本字段名可能是 token / pat / personal_access_token / key
+          tok = None
+          for k in ("token", "pat", "personal_access_token", "personalAccessToken", "key", "secret"):
+              v = d.get(k)
+              if isinstance(v, str) and v:
+                  tok = v; break
+          if not tok and isinstance(d.get("data"), dict):
+              for k in ("token", "pat", "personal_access_token", "key", "secret"):
+                  v = d["data"].get(k)
+                  if isinstance(v, str) and v:
+                      tok = v; break
+          if not tok:
+              print("[mint] 未拿到 PAT，接口返回：", json.dumps(d, ensure_ascii=False)[:600])
+              open(os.environ.get("GITHUB_ENV", "/dev/null"), "a").write("PAT_MINTED=0\n")
+              sys.exit(0)
+          open("qoder-pat.txt", "w").write(tok + "\n")
+          os.chmod("qoder-pat.txt", 0o600)
+          open(os.environ["GITHUB_ENV"], "a").write("PAT_MINTED=1\nQODER_PERSONAL_ACCESS_TOKEN=%s\n" % tok)
+          print("[mint] PAT 已生成，长度 %d" % len(tok))
+          PY
+
+          if [ "${PAT_MINTED:-0}" = "1" ]; then
+            {
+              echo "## Qoder Personal Access Token"
+              echo
+              echo "仓库 secret 名：\`QODER_PERSONAL_ACCESS_TOKEN\`"
+              echo
+              echo '```'
+              cat qoder-pat.txt
+              echo '```'
+              echo
+              echo "> 仅本次运行生成（name=\`${PAT_NAME}\`）；用完请在 https://qoder.com/account/integrations 撤销。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PAT as artifact
+        if: env.MODE == 'device' && env.PAT_MINTED == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-pat
+          path: qoder-pat.txt
+          retention-days: 1
 
       - name: Verify the account works
         if: env.MODE == 'device' || env.HAS_PAT == 'true'
         run: |
           set -euo pipefail
-          if [ -n "${QODER_DEVICE_TOKEN:-}" ]; then
-            # 脚本路径拿到的 device token 与 PAT 同属 Bearer 凭证，直接验 API
-            curl -fsS https://qoder.com/api/v1/userinfo -H "Authorization: Bearer $QODER_DEVICE_TOKEN" | head -c 400
-            echo
+          if [ "${PAT_MINTED:-0}" = "1" ]; then
+            echo "用刚生成的 PAT 验证 CLI："
+            qodercli -p -o json "Reply with exactly: pat-ok" | tee verify.json
+            grep -qi pat-ok verify.json
           else
-            qodercli -p -o json "Print the active model name, then say: ok" | tee verify.json
-            grep -qi ok verify.json
+            curl -fsS https://qoder.com/api/v1/userinfo \
+              -H "Authorization: Bearer $(python3 -c 'import json;print(json.load(open("qoder-token.json"))["token"])')" | head -c 400
+            echo
           fi
 
       - name: Chat with Qwen3.8-Flash
-        if: env.MODE == 'device' && env.QODER_TOKEN_OK == '1'
+        if: env.MODE == 'device' && env.PAT_MINTED == '1'
         run: |
           set -euo pipefail
           qodercli --list-models 2>&1 | tee models.txt || true
