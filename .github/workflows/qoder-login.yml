@@ -3,9 +3,10 @@ name: qoder-login
 # Qoder 账号在 GitHub Actions 上「注册 + 登录」
 #
 # Linux 客户端 = Qoder CLI 官方 Linux 版（qoder.com/install，manifest 带 sha256）
+# 注意：安装脚本落地的入口是 `qodercli`（不是文档里的 `qoder`）。
 #
 # 两条路径：
-#   device —— 设备码登录（首次 / 换号 / 顺便注册）：Job 把授权链接写进 Summary，
+#   device —— 设备码登录（首次 / 换号 / 顺手注册）：Job 把授权链接写进 Summary，
 #             人在浏览器里注册或登录，CLI 自己完成授权并把凭据写进 QODER_CONFIG_DIR，
 #             随后 cache 起来给后续 Job 复用。
 #   pat    —— 无人值守：Secret 里放 QODER_PERSONAL_ACCESS_TOKEN
@@ -30,7 +31,6 @@ on:
         default: "900"
   push:
     branches: [main]
-  pull_request:
 
 permissions:
   contents: read
@@ -51,6 +51,7 @@ jobs:
       QODER_CONFIG_DIR: ${{ github.workspace }}/.qoder-home
       MODE: ${{ github.event.inputs.mode || 'pat' }}
       LOGIN_TIMEOUT: ${{ github.event.inputs.login_timeout || '900' }}
+      HAS_PAT: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +62,7 @@ jobs:
           curl -fsSL https://qoder.com/install | bash -s -- --force --skip-path
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
-          qoder --version
+          qodercli --version
 
       - name: Restore cached Qoder credentials
         uses: actions/cache/restore@v4
@@ -73,15 +74,20 @@ jobs:
 
       # ---------------- A. PAT 路径 ----------------
       - name: Login with Personal Access Token
-        if: env.MODE == 'pat'
+        if: env.MODE == 'pat' && env.HAS_PAT == 'true'
         env:
           QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "${QODER_PERSONAL_ACCESS_TOKEN:-}" || { echo "::error::缺少 secret QODER_PERSONAL_ACCESS_TOKEN"; exit 1; }
-          qoder -p -o json "Reply with exactly: pong" | tee pat-check.json
+          qodercli -p -o json "Reply with exactly: pong" | tee pat-check.json
           grep -qi pong pat-check.json
           echo "PAT 登录可用" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip PAT login (secret missing)
+        if: env.MODE == 'pat' && env.HAS_PAT != 'true'
+        run: |
+          echo "::notice::未配置 secret QODER_PERSONAL_ACCESS_TOKEN，跳过 PAT 登录；改用 workflow_dispatch + mode=device"
+          echo "未配置 PAT，已跳过。设备码登录请手动触发：mode=device" >> "$GITHUB_STEP_SUMMARY"
 
       # ---------------- B. 设备码路径（CLI 原生登录） ----------------
       - name: Start device login and publish the URL
@@ -92,7 +98,7 @@ jobs:
           mkdir -p "$QODER_CONFIG_DIR"
           : > login.log
           # CLI 在 CI 里会自动走设备码：打印 URL -> 轮询 -> 授权后把凭据写进 QODER_CONFIG_DIR
-          setsid qoder login >>login.log 2>&1 &
+          setsid qodercli login >>login.log 2>&1 &
           echo $! > login.pid
 
           URL=""
@@ -155,6 +161,7 @@ jobs:
           echo "QODER_TOKEN_OK=1" >> "$GITHUB_ENV"
 
       - name: Verify the account works
+        if: env.MODE == 'device' || env.HAS_PAT == 'true'
         run: |
           set -euo pipefail
           if [ -n "${QODER_DEVICE_TOKEN:-}" ]; then
@@ -162,7 +169,7 @@ jobs:
             curl -fsS https://qoder.com/api/v1/userinfo -H "Authorization: Bearer $QODER_DEVICE_TOKEN" | head -c 400
             echo
           else
-            qoder -p -o json "Print the active model name, then say: ok" | tee verify.json
+            qodercli -p -o json "Print the active model name, then say: ok" | tee verify.json
             grep -qi ok verify.json
           fi
 
