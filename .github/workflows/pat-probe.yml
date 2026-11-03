@@ -1,0 +1,18 @@
+name: pat-probe
+on:
+  workflow_dispatch:
+    inputs:
+      token:
+        required: true
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CLI
+        run: curl -fsSL https://qoder.com/install | bash
+      - name: Try token as PAT
+        env:
+          QODER_PERSONAL_ACCESS_TOKEN: ${{ inputs.token }}
+        run: |
+          timeout 120 qodercli -p -o json "Reply with exactly: pat-ok" || echo "EXIT=$?"
