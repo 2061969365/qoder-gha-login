@@ -56,6 +56,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reset Qoder state (fresh every run)
+        run: |
+          set -euo pipefail
+          rm -rf "$QODER_CONFIG_DIR" qoder-token.json userinfo.json verify.json login.log login.pid login-url.txt
+          mkdir -p "$QODER_CONFIG_DIR"
+          echo "已清空本地凭据，本次运行按全新环境登录" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install Qoder CLI (Linux x64)
         run: |
           set -euo pipefail
@@ -63,14 +70,6 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
           qodercli --version
-
-      - name: Restore cached Qoder credentials
-        uses: actions/cache/restore@v4
-        with:
-          path: .qoder-home
-          key: qoder-home-${{ github.repository }}-${{ github.run_id }}
-          restore-keys: |
-            qoder-home-${{ github.repository }}-
 
       # ---------------- A. PAT 路径 ----------------
       - name: Login with Personal Access Token
@@ -183,13 +182,6 @@ jobs:
             qodercli -p -o json "Print the active model name, then say: ok" | tee verify.json
             grep -qi ok verify.json
           fi
-
-      - name: Save credential cache
-        if: env.QODER_TOKEN_OK == '1'
-        uses: actions/cache/save@v4
-        with:
-          path: .qoder-home
-          key: qoder-home-${{ github.repository }}-${{ github.run_id }}
 
       - name: Upload logs
         if: always()

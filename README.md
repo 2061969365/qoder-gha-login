@@ -53,8 +53,9 @@ Actions → qoder-login → Run workflow → mode = device
    - 已有账号 → 登录 → 选账号 → 授权；
    - 没有账号 → 点 **Sign up**，邮箱验证码注册，完成后 `oauth_callback` 把你带回
      `/device/selectAccounts?...`，确认授权；
-3. Job 等 CLI 退出（授权成功会打 `Login successful! Welcome, <name>`），凭据写进
-   `QODER_CONFIG_DIR`（`.qoder-home`），随后 cache 起来给后续 Job 复用；
+3. Job 等 CLI 退出（授权成功会打 `Login successful! Welcome, <name>`），凭据只写进
+   本次运行的 `QODER_CONFIG_DIR`（`.qoder-home`），**不缓存、不上传，运行结束即丢弃**；
+   每次都是全新环境，需要重新授权（这是刻意设计，方便验证"从零登录"链路）；
 4. `Verify the account works` 用 `qoder -p` 或 `/api/v1/userinfo` 验一遍。
 
 超时（默认 900s）没点授权就重跑，会生成新链接。
@@ -109,6 +110,6 @@ qoder -p "run tests and fix failures"
 ## 5. 安全
 
 - `qoder-token.json`、`.qoder-device.json`、`.qoder-home/` 都是明文凭证，`.gitignore` 已排除；
-  workflow 只上传日志，不传凭证文件。
+  workflow 每次运行开头 `Reset Qoder state` 主动清空，且只上传日志、不传凭证文件。
 - 授权链接 5 分钟内有效（CLI 侧超时 `300000ms`），过期重跑。
 - 同账号多机各自持一份 device token，互不影响。
