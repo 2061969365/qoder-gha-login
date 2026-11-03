@@ -27,8 +27,8 @@ on:
         options: [device, pat]
         default: device
       login_timeout:
-        description: "等待浏览器授权的超时（秒）"
-        default: "900"
+        description: "等待浏览器授权超时（秒，CLI 自身硬上限 300s）"
+        default: "330"
   push:
     branches: [main]
 
@@ -50,7 +50,7 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       QODER_CONFIG_DIR: ${{ github.workspace }}/.qoder-home
       MODE: ${{ github.event.inputs.mode || 'pat' }}
-      LOGIN_TIMEOUT: ${{ github.event.inputs.login_timeout || '900' }}
+      LOGIN_TIMEOUT: ${{ github.event.inputs.login_timeout || '330' }}
       HAS_PAT: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN != '' }}
 
     steps:
@@ -121,7 +121,7 @@ jobs:
             echo "1. 打开下面的链接（手机也可以）"
             echo "2. 已有账号 → 直接登录；没有账号 → 点 **Sign up** 注册（邮箱验证码），"
             echo "   注册完成后 oauth_callback 会把你带回授权页"
-            echo "3. 选账号确认授权 —— 本 Job 会自动继续（最长 ${LOGIN_TIMEOUT}s）"
+            echo "3. 选账号确认授权 —— **链接只有 5 分钟有效期**（qodercli 侧硬超时 300s），过期重跑换新链接"
             echo
             echo '```'
             echo "$URL"
@@ -183,6 +183,43 @@ jobs:
             grep -qi ok verify.json
           fi
 
+      - name: Chat with Qwen3.8-Flash
+        if: env.MODE == 'device' && env.QODER_TOKEN_OK == '1'
+        run: |
+          set -euo pipefail
+          qodercli --list-models 2>&1 | tee models.txt || true
+
+          # 从模型列表里挑 Qwen3.8-Flash 的 id，挑不到就按名字兜底
+          CANDIDATES=$(grep -oiE '[A-Za-z0-9._/-]*qwen[0-9.]*[-_]?flash[A-Za-z0-9._/-]*' models.txt | sort -u | tr '\n' ' ')
+          CANDIDATES="$CANDIDATES qwen3.8-flash qwen3.8-flash-latest"
+          echo "候选模型: $CANDIDATES"
+
+          PROMPT="用中文回答：你是谁？请用两句话介绍你自己，并说明你现在能帮我做什么。"
+          OK=0
+          for M in $CANDIDATES; do
+            echo "---- 尝试模型: $M"
+            if qodercli -m "$M" -p "$PROMPT" -o json > chat.json 2>chat.err; then
+              if python3 -c 'import json,sys;d=json.load(open("chat.json"));sys.exit(0 if d.get("result") else 1)' 2>/dev/null; then
+                echo "$M" > model-id.txt
+                OK=1
+                echo "---- 使用模型: $M"
+                break
+              fi
+            fi
+            cat chat.err || true
+          done
+
+          [ "$OK" = "1" ] || { echo "::error::Qwen3.8-Flash 调用失败"; cat models.txt; exit 1; }
+
+          python3 -c "
+          import json
+          d=json.load(open('chat.json'))
+          print('model=%s  subtype=%s  is_error=%s' % (open('model-id.txt').read().strip(), d.get('subtype'), d.get('is_error')))
+          print()
+          print((d.get('result') or '').strip())
+          " | tee chat-summary.md
+          cat chat-summary.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -192,4 +229,7 @@ jobs:
             login.log
             verify.json
             pat-check.json
+            models.txt
+            chat.json
+            chat-summary.md
           if-no-files-found: ignore
