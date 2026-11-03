@@ -1,0 +1,195 @@
+name: qoder-desktop-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      login_timeout:
+        description: "等待桌面端登录完成的超时（秒）"
+        required: false
+        default: "900"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/qoder-desktop-windows.yml"
+      - "windows/**"
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      LOGIN_TIMEOUT: ${{ github.event.inputs.login_timeout || '900' }}
+      CAP_DIR: C:\qoder-capture
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Qoder desktop (silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Join-Path $env:RUNNER_TEMP "QoderSetup.exe"
+          Invoke-WebRequest -Uri "https://download.qoder.com/qoder-app/releases/latest/Qoder-win-x64-user.exe" -OutFile $setup
+          Write-Host "installer size: $((Get-Item $setup).Length)"
+          $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+          $candidates = @(
+            "$env:LOCALAPPDATA\Programs\Qoder\Qoder.exe",
+            "$env:ProgramFiles\Qoder\Qoder.exe",
+            "${env:ProgramFiles(x86)}\Qoder\Qoder.exe"
+          )
+          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) { throw "Qoder.exe not found after install" }
+          Write-Host "QODER_EXE=$exe"
+          "QODER_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build isolated profile + capture browser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path $env:CAP_DIR | Out-Null
+          Copy-Item "windows\capture-browser.cmd" (Join-Path $env:CAP_DIR "capture-browser.cmd") -Force
+          $cmd = Join-Path $env:CAP_DIR "capture-browser.cmd"
+
+          foreach ($proto in @("http", "https")) {
+            $key = "HKCU:\Software\Classes\$proto\shell\open\command"
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name "(default)" -Value "`"$cmd`" `"%1`""
+            # 删掉 UserChoice，否则 Windows 会用 Edge 而不是我们的捕获脚本
+            $uc = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$proto\UserChoice"
+            Remove-Item -Path $uc -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "default browser hijacked -> $cmd"
+
+      - name: Launch Qoder desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @("--remote-debugging-port=9222", "--disable-gpu")
+          $p = Start-Process -FilePath $env:QODER_EXE -ArgumentList $args -PassThru
+          Write-Host "pid=$($p.Id)"
+          Start-Sleep -Seconds 8
+          Get-Process | Where-Object { $_.ProcessName -like "*Qoder*" } |
+            Select-Object Id, ProcessName, MainWindowTitle | Format-Table | Out-String | Write-Host
+
+      - name: Trigger device login and publish URL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $urlFile = Join-Path $env:CAP_DIR "urls.txt"
+          node windows\trigger-login.mjs
+          $deadline = (Get-Date).AddSeconds(180)
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $urlFile) {
+              $url = Get-Content $urlFile | Where-Object { $_ -match "qoder\.com/.+(device|sign-in)" } | Select-Object -Last 1
+              if ($url) {
+                $url | Out-File -FilePath "login-url.txt" -Encoding utf8
+                @"
+          ## Qoder 桌面端登录
+          
+          1. 在任意浏览器打开下面的链接
+          2. 已有账号直接登录；没有账号先注册（邮箱验证码）
+          3. 授权后桌面端会自动登录（最长 $env:LOGIN_TIMEOUT 秒）
+          
+          ```
+          $url
+          ```
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+                Write-Host "captured: $url"
+                exit 0
+              }
+            }
+            Start-Sleep -Seconds 3
+          }
+          Write-Host "=== captured urls ==="
+          if (Test-Path $urlFile) { Get-Content $urlFile } else { Write-Host "(none)" }
+          throw "no auth URL captured"
+
+      - name: Upload login URL
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-desktop-login-url
+          path: login-url.txt
+          retention-days: 1
+
+      - name: Wait for desktop login and export token
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $auth = Join-Path "$env:APPDATA\com.qoder.app.stable" "auth.v1.dat"
+          $deadline = (Get-Date).AddSeconds([int]$env:LOGIN_TIMEOUT)
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $auth) {
+              try {
+                $json = & windows\decrypt-auth.ps1 -ProfileDir "$env:APPDATA\com.qoder.app.stable"
+                if ($json) {
+                  $json | Out-File -FilePath "desktop-auth.json" -Encoding utf8
+                  $obj = $json | ConvertFrom-Json
+                  Write-Host "logged in as: $($obj.user.name) <$($obj.user.email)>"
+                  @"
+          ## 桌面端登录成功
+          
+          - 用户：$($obj.user.name)
+          - 邮箱：$($obj.user.email)
+          - access token：`$($obj.token)`
+          - refresh token：`$($obj.refreshToken)`
+          - 过期：$($obj.expiresAt)
+          
+          > 这是桌面端会话 token（dt-/drt-），不是 qoder.com 控制台的 pt- PAT。
+          > 它能调 openapi.qoder.sh，但不能直接当 qodercli 的 QODER_PERSONAL_ACCESS_TOKEN。
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+                  exit 0
+                }
+              } catch {
+                Write-Host "auth.v1.dat present but not decryptable yet: $_"
+              }
+            }
+            Start-Sleep -Seconds 5
+          }
+          throw "desktop login did not complete in $env:LOGIN_TIMEOUT s"
+
+      - name: Verify token against openapi
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $obj = Get-Content "desktop-auth.json" -Raw | ConvertFrom-Json
+          $r = Invoke-RestMethod -Uri "https://openapi.qoder.sh/api/v1/userinfo" -Headers @{ Authorization = "Bearer $($obj.token)" }
+          Write-Host "userinfo: $($r.name) / $($r.email)"
+          "TOKEN_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload token artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-desktop-token
+          path: |
+            desktop-auth.json
+            login-url.txt
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Dump diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== captured urls ==="
+          if (Test-Path "$env:CAP_DIR\urls.txt") { Get-Content "$env:CAP_DIR\urls.txt" }
+          Write-Host "=== profile ==="
+          $prof = Join-Path $env:APPDATA "com.qoder.app.stable"; if (Test-Path $prof) { Get-ChildItem $prof | Select-Object Name, Length | Format-Table | Out-String | Write-Host }
+          Write-Host "=== app logs ==="
+          $logDir = Join-Path (Join-Path $env:APPDATA "com.qoder.app.stable") "logs"
+          if (Test-Path $logDir) {
+            Get-ChildItem $logDir -Recurse -Filter main.log -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1 |
+              ForEach-Object { Get-Content $_.FullName -Tail 60 }
+          }
