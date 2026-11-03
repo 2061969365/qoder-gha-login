@@ -16,9 +16,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CI: "true"
-
 jobs:
   desktop:
     runs-on: windows-latest
@@ -53,7 +50,7 @@ jobs:
           Write-Host "QODER_EXE=$exe"
           "QODER_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build isolated profile + capture browser
+      - name: Prepare URL capture
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -65,18 +62,16 @@ jobs:
             $key = "HKCU:\Software\Classes\$proto\shell\open\command"
             New-Item -Path $key -Force | Out-Null
             Set-ItemProperty -Path $key -Name "(default)" -Value "`"$cmd`" `"%1`""
-            # 删掉 UserChoice，否则 Windows 会用 Edge 而不是我们的捕获脚本
             $uc = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$proto\UserChoice"
             Remove-Item -Path $uc -Recurse -Force -ErrorAction SilentlyContinue
           }
-          Write-Host "default browser hijacked -> $cmd"
+          Write-Host "browser handler installed -> $cmd"
 
       - name: Launch Qoder desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $args = @("--remote-debugging-port=9222", "--disable-gpu")
-          $p = Start-Process -FilePath $env:QODER_EXE -ArgumentList $args -PassThru
+          $p = Start-Process -FilePath $env:QODER_EXE -ArgumentList "--remote-debugging-port=9222", "--disable-gpu" -PassThru
           Write-Host "pid=$($p.Id)"
           Start-Sleep -Seconds 8
           Get-Process | Where-Object { $_.ProcessName -like "*Qoder*" } |
@@ -88,26 +83,57 @@ jobs:
           $ErrorActionPreference = "Stop"
           $urlFile = Join-Path $env:CAP_DIR "urls.txt"
           node windows\trigger-login.mjs
+
+          function Get-DomUrls {
+            $found = @()
+            try {
+              $targets = Invoke-RestMethod -Uri "http://127.0.0.1:9222/json/list" -TimeoutSec 5
+            } catch { return $found }
+            foreach ($t in $targets) {
+              if ($t.type -ne "page" -or -not $t.webSocketDebuggerUrl) { continue }
+              $expr = '(()=>{const t=document.body?document.body.innerText:"";const m=t.match(/https:\/\/qoder\.com\/[^\s"''<>]+/g);return m?m.join("\n"):""})()'
+              $out = & node -e "const ws=new WebSocket(process.argv[1]);ws.onopen=()=>ws.send(JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression:process.argv[2],returnByValue:true}}));ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id===1){console.log((m.result&&m.result.result&&m.result.result.value)||'');process.exit(0)}};setTimeout(()=>process.exit(0),5000);" $t.webSocketDebuggerUrl $expr 2>$null
+              if ($out) { $found += ($out -split "`n") }
+            }
+            return $found
+          }
+
+          function Get-ProcessUrls {
+            $found = @()
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -match "qoder\.com/" } |
+              ForEach-Object {
+                $m = [regex]::Match($_.CommandLine, "https://qoder\.com/[^\s`"']+")
+                if ($m.Success) { $found += $m.Value }
+              }
+            return $found
+          }
+
           $deadline = (Get-Date).AddSeconds(180)
           while ((Get-Date) -lt $deadline) {
-            if (Test-Path $urlFile) {
-              $url = Get-Content $urlFile | Where-Object { $_ -match "qoder\.com/.+(device|sign-in)" } | Select-Object -Last 1
-              if ($url) {
-                $url | Out-File -FilePath "login-url.txt" -Encoding utf8
-                @"
+            $found = @()
+            if (Test-Path $urlFile) { $found += (Get-Content $urlFile) }
+            $found += Get-ProcessUrls
+            $found += Get-DomUrls
+            $url = $found |
+              Where-Object { $_ -match "^https://qoder\.com/.+(device|sign-in)" } |
+              Select-Object -Unique -First 1
+            if ($url) {
+              $url = $url.Trim()
+              $url | Out-File -FilePath "login-url.txt" -Encoding utf8
+              @"
           ## Qoder 桌面端登录
-          
+
           1. 在任意浏览器打开下面的链接
           2. 已有账号直接登录；没有账号先注册（邮箱验证码）
           3. 授权后桌面端会自动登录（最长 $env:LOGIN_TIMEOUT 秒）
-          
+
           ```
           $url
           ```
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-                Write-Host "captured: $url"
-                exit 0
-              }
+              Write-Host "captured: $url"
+              exit 0
             }
             Start-Sleep -Seconds 3
           }
@@ -126,25 +152,26 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $auth = Join-Path "$env:APPDATA\com.qoder.app.stable" "auth.v1.dat"
+          $profileDir = Join-Path $env:APPDATA "com.qoder.app.stable"
+          $auth = Join-Path $profileDir "auth.v1.dat"
           $deadline = (Get-Date).AddSeconds([int]$env:LOGIN_TIMEOUT)
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $auth) {
               try {
-                $json = & windows\decrypt-auth.ps1 -ProfileDir "$env:APPDATA\com.qoder.app.stable"
+                $json = & windows\decrypt-auth.ps1 -ProfileDir $profileDir
                 if ($json) {
                   $json | Out-File -FilePath "desktop-auth.json" -Encoding utf8
                   $obj = $json | ConvertFrom-Json
                   Write-Host "logged in as: $($obj.user.name) <$($obj.user.email)>"
                   @"
           ## 桌面端登录成功
-          
+
           - 用户：$($obj.user.name)
           - 邮箱：$($obj.user.email)
-          - access token：`$($obj.token)`
-          - refresh token：`$($obj.refreshToken)`
+          - access token：``$($obj.token)``
+          - refresh token：``$($obj.refreshToken)``
           - 过期：$($obj.expiresAt)
-          
+
           > 这是桌面端会话 token（dt-/drt-），不是 qoder.com 控制台的 pt- PAT。
           > 它能调 openapi.qoder.sh，但不能直接当 qodercli 的 QODER_PERSONAL_ACCESS_TOKEN。
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
@@ -184,12 +211,13 @@ jobs:
         run: |
           Write-Host "=== captured urls ==="
           if (Test-Path "$env:CAP_DIR\urls.txt") { Get-Content "$env:CAP_DIR\urls.txt" }
+          $prof = Join-Path $env:APPDATA "com.qoder.app.stable"
           Write-Host "=== profile ==="
-          $prof = Join-Path $env:APPDATA "com.qoder.app.stable"; if (Test-Path $prof) { Get-ChildItem $prof | Select-Object Name, Length | Format-Table | Out-String | Write-Host }
+          if (Test-Path $prof) { Get-ChildItem $prof | Select-Object Name, Length | Format-Table | Out-String | Write-Host }
           Write-Host "=== app logs ==="
-          $logDir = Join-Path (Join-Path $env:APPDATA "com.qoder.app.stable") "logs"
+          $logDir = Join-Path $prof "logs"
           if (Test-Path $logDir) {
             Get-ChildItem $logDir -Recurse -Filter main.log -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1 |
-              ForEach-Object { Get-Content $_.FullName -Tail 60 }
+              ForEach-Object { Get-Content $_.FullName -Tail 80 }
           }
